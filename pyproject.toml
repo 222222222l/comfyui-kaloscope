@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-kaloscope"
-description = "LSNet and DINOv3 inference, features and analysis for ComfyUI, WebUI and standalone use"
+description = "kaloscope and DINOv3 inference, features and analysis for ComfyUI, WebUI and standalone use"
 version = "1.0.0"
 license = {file = "LICENSE"} 
 # classifiers = [
@@ -26,10 +26,10 @@ dependencies = ["einops>=0.8.1", "fvcore", "easydict", "matplotlib", "yacs", "sc
 webui = ["gradio>=3.41,<6", "fastapi", "uvicorn", "python-multipart"]
 
 [project.urls]
-Repository = "https://github.com/spawner1145/comfyui-lsnet"
+Repository = "https://github.com/spawner1145/comfyui-kaloscope"
 #  Used by Comfy Registry https://registry.comfy.org
-Documentation = "https://github.com/spawner1145/comfyui-lsnet/wiki"
-"Bug Tracker" = "https://github.com/spawner1145/comfyui-lsnet/issues"
+Documentation = "https://github.com/spawner1145/comfyui-kaloscope/wiki"
+"Bug Tracker" = "https://github.com/spawner1145/comfyui-kaloscope/issues"
 
 [tool.comfy]
 PublisherId = "spawner"
