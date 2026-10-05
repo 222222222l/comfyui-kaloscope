@@ -6,7 +6,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # API 配置
-API_URL = "http://127.0.0.1:7871/lsnet/v1/cancel"
+API_URL = "http://127.0.0.1:7871/kaloscope/v1/cancel"
 USERNAME = "user"  # 替换为你的用户名，如果未启用认证可留空
 PASSWORD = "password"  # 替换为你的密码，如果未启用认证可留空
 

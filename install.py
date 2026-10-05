@@ -49,8 +49,10 @@ requirements = [
     "timm>=1.0.20",
     "numpy>=1.19.0",
     "Pillow>=8.0.0",
-    "scikit-learn>=1.0.0",
-    "tqdm>=4.60.0"
+    "scikit-learn>=1.2.0",
+    "scipy>=1.8.0",
+    "tqdm>=4.60.0",
+    "safetensors>=0.4.0"
 ]
 
 # Add triton-windows only on Windows
@@ -59,7 +61,7 @@ if sys.platform == 'win32':
 
 # Add webui packages
 webui_packages = [
-    "gradio",
+    "gradio>=3.41,<6",
     "fastapi",
     "uvicorn",
     "python-multipart"
@@ -68,4 +70,4 @@ requirements.extend(webui_packages)
 
 for req in requirements:
     if not is_installed(req):
-        launch.run_pip(f"install {req}", f"sd-webui-lsnet requirement: {req}")
+        launch.run_pip(f"install {req}", f"comfyui-kaloscope requirement: {req}")

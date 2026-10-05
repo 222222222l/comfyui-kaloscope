@@ -2,43 +2,28 @@ import os
 import sys
 import json
 import torch
-import torch.nn.functional as F
 from PIL import Image
 import numpy as np
-from pathlib import Path
-from typing import Dict, Optional
 
 sys.path.append(os.path.dirname(__file__))
 
 import folder_paths
 
-from timm.data import resolve_data_config
-from timm.data.transforms_factory import create_transform
-from timm.models import create_model
-
-from lsnet_model import lsnet_artist  # noqa: F401
-
-from inference_artist import (
-    load_checkpoint_state,
-    normalize_state_dict_keys,
-    resolve_num_classes,
-    resolve_feature_dim,
-    load_class_mapping
-)
+from model_loading import FEATURE_OUTPUTS, load_model_bundle, model_folders
+from inference_artist import classify_image, extract_features
+from feature_analysis import CHART_TYPES, TENSOR_LAYOUTS, analyze_features
+from backend_lsnet.analysis import extract_batch, output_layout
 
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
-class LSNetModelLoader:
+class KaloscopeModelLoader:
     @classmethod
     def INPUT_TYPES(s):
-        base_dir = os.path.join(folder_paths.models_dir, 'lsnet')
-        subfolders = []
-        if os.path.exists(base_dir):
-            subfolders = [f for f in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, f))]
-        
+        subfolders = sorted(model_folders(folder_paths.models_dir))
+
         return {
             "required": {
                 "model_folder": (subfolders, {"default": subfolders[0] if subfolders else ""}),
@@ -46,77 +31,24 @@ class LSNetModelLoader:
             }
         }
 
-    RETURN_TYPES = ("LSNET_MODEL",)
+    RETURN_TYPES = ("KALOSCOPE_MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def load(self, model_folder, device):
-        base_dir = os.path.join(folder_paths.models_dir, 'lsnet')
-        model_dir = os.path.join(base_dir, model_folder)
-        checkpoint_path = os.path.join(model_dir, "best_checkpoint.pth")
-        csv_path = os.path.join(model_dir, "class_mapping.csv")
+        folders = model_folders(folder_paths.models_dir)
+        if model_folder not in folders:
+            raise FileNotFoundError(f"Model folder not found: {model_folder}")
+        return (load_model_bundle(folders[model_folder], device=device),)
 
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"Class mapping CSV not found: {csv_path}")
-        class_mapping = load_class_mapping(csv_path)
-        state_dict = load_checkpoint_state(checkpoint_path)
-        state_dict = normalize_state_dict_keys(state_dict)
-        num_classes = resolve_num_classes(None, class_mapping, state_dict)
-        feature_dim = resolve_feature_dim(None, state_dict)
-        
-        # 自动从config.json读取model类型
-        config_path = os.path.join(model_dir, "config.json")
-        model_type = 'lsnet_xl_artist'  # 默认值
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    if 'model' in config and config['model'] in ['lsnet_t_artist', 'lsnet_s_artist', 'lsnet_b_artist', 'lsnet_l_artist', 'lsnet_xl_artist', 'lsnet_xl_artist_448']:
-                        model_type = config['model']
-                        print(f"Model type loaded from config: {model_type}")
-            except Exception as e:
-                print(f"Warning: Failed to load config.json: {e}")
-        
-        model = create_model(
-            model_type,
-            pretrained=False,
-            num_classes=num_classes,
-            feature_dim=feature_dim,
-        )
-        model.load_state_dict(state_dict, strict=False)
-        model.to(device)
-        model.eval()
-        
-        # 根据模型配置动态设置输入大小
-        from lsnet_model.lsnet_artist import default_cfgs_artist
-        input_size = 224  # 默认值
-        if model_type in default_cfgs_artist:
-            model_cfg = default_cfgs_artist[model_type]
-            configured_input_size = model_cfg.get('input_size', (3, 224, 224))[1]  # 获取高度（假设正方形）
-            input_size = configured_input_size
-            print(f"Auto-setting input_size to {input_size} for model {model_type}")
-        
-        config = resolve_data_config({'input_size': (3, input_size, input_size)}, model=model)
-        transform = create_transform(**config)
-        model_bundle = {
-            'model': model,
-            'transform': transform,
-            'class_mapping': class_mapping,
-            'device': device
-        }
-
-        return (model_bundle,)
-
-class LSNetArtistInferenceNode:
+class KaloscopeArtistInferenceNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "model": ("LSNET_MODEL",),
+                "model": ("KALOSCOPE_MODEL",),
                 "top_k": ("INT", {"default": 5, "min": 1, "max": 100}),
                 "threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0}),
             }
@@ -125,7 +57,7 @@ class LSNetArtistInferenceNode:
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("tag_string", "json_output")
     FUNCTION = "process"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def process(self, image, model, top_k, threshold):
         model_bundle = model
@@ -142,27 +74,11 @@ class LSNetArtistInferenceNode:
         # Preprocess image
         image_tensor = transform(pil_image).unsqueeze(0)  # Add batch dimension
 
-        # Classify
-        with torch.no_grad():
-            image_tensor = image_tensor.to(device)
-            logits = model(image_tensor, return_features=False)
-            probs = F.softmax(logits, dim=-1)
-            top_probs, top_indices = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
-
-            results = []
-            for prob, idx in zip(top_probs[0].cpu().numpy(), top_indices[0].cpu().numpy()):
-                if prob >= threshold:
-                    class_id = int(idx)
-                    class_name = class_mapping.get(class_id, f"Class {class_id}")
-                    results.append({
-                        'class_id': class_id,
-                        'class_name': class_name,
-                        'probability': float(prob)
-                    })
-
-            # Limit to top_k if more results after filtering
-            if len(results) > top_k:
-                results = results[:top_k]
+        if not model_bundle['has_classifier']:
+            features = extract_features(model, image_tensor, device)[0].tolist()
+            return ('', json.dumps({'features': features, 'feature_dim': len(features),
+                                    'feature_source': model_bundle['feature_source']}, ensure_ascii=False))
+        results = classify_image(model, image_tensor, device, class_mapping, top_k, threshold)
 
         # Prepare outputs
         tags = [res['class_name'] for res in results]
@@ -172,21 +88,21 @@ class LSNetArtistInferenceNode:
 
         return (tag_string, json_output)
 
-class LSNetArtistSimilarityNode:
+class KaloscopeArtistSimilarityNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "processed_image": ("IMAGE",),
                 "reference_images": ("IMAGE",),
-                "model": ("LSNET_MODEL",),
+                "model": ("KALOSCOPE_MODEL",),
             }
         }
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("similarity_json",)
     FUNCTION = "process"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def process(self, processed_image, reference_images, model):
         model_bundle = model
@@ -228,20 +144,20 @@ class LSNetArtistSimilarityNode:
 
         return (json_output,)
 
-class LSNetCommonFeaturesNode:
+class KaloscopeCommonFeaturesNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "reference_images": ("IMAGE",),
-                "model": ("LSNET_MODEL",),
+                "model": ("KALOSCOPE_MODEL",),
             }
         }
 
     RETURN_TYPES = ("TENSOR",)
     RETURN_NAMES = ("common_features",)
     FUNCTION = "process"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def process(self, reference_images, model):
         model_bundle = model
@@ -269,10 +185,10 @@ class LSNetCommonFeaturesNode:
         if references:
             common_features = np.mean(np.array(references), axis=0)
         else:
-            common_features = np.zeros(384)
+            common_features = np.zeros(model_bundle['feature_dim'])
         return (torch.tensor(common_features),)
 
-class LSNetClusteringNode:
+class KaloscopeClusteringNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -295,7 +211,7 @@ class LSNetClusteringNode:
     RETURN_TYPES = ("STRING", "IMAGE")
     RETURN_NAMES = ("clustering_json", "visualization")
     FUNCTION = "cluster"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def cluster(self, method, n_clusters, eps, min_samples, visualize, viz_method, perplexity, group_1=None, group_2=None, group_3=None):
         groups = []
@@ -356,9 +272,9 @@ class LSNetClusteringNode:
             
             fig = plt.gcf()
             fig.canvas.draw()
-            img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            pil_image = Image.fromarray(img_array)
+            img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+            pil_image = Image.fromarray(img_array[:, :, :3])
             plt.close()
             
             viz_tensor = torch.from_numpy(np.array(pil_image)).float() / 255.0
@@ -369,13 +285,13 @@ class LSNetClusteringNode:
 
         return (json_output, viz_tensor)
 
-class LSNetFeatureComparisonNode:
+class KaloscopeFeatureComparisonNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "model": ("LSNET_MODEL",),
+                "model": ("KALOSCOPE_MODEL",),
             },
             "optional": {
                 "group_1": ("TENSOR",),
@@ -387,7 +303,7 @@ class LSNetFeatureComparisonNode:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("comparison_json",)
     FUNCTION = "compare"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def compare(self, image, model, group_1=None, group_2=None, group_3=None):
         model_bundle = model
@@ -429,7 +345,7 @@ class LSNetFeatureComparisonNode:
 
         return (json_output,)
 
-class LSNetArtistImageConnector:
+class KaloscopeArtistImageConnector:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -443,7 +359,7 @@ class LSNetArtistImageConnector:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("stacked_images",)
     FUNCTION = "connect"
-    CATEGORY = "LSNet"
+    CATEGORY = "Kaloscope"
 
     def connect(self, image_1, image_2, image_3):
         def normalize_image(img):
@@ -458,22 +374,116 @@ class LSNetArtistImageConnector:
         stacked = torch.cat([img1, img2, img3], dim=0)
         return (stacked,)
 
+class KaloscopeExtractFeaturesNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            'required': {'image': ('IMAGE',), 'model': ('KALOSCOPE_MODEL',)},
+            'optional': {
+                'output_type': (list(FEATURE_OUTPUTS), {'default': 'default'}),
+                'layers': ('STRING', {'default': '-1', 'tooltip': 'Intermediate layer indices, e.g. -1 or 8,9,10,11; negative indices count from the end.'}),
+                'intermediate_norm': ('BOOLEAN', {'default': True, 'tooltip': 'Apply model LayerNorm to intermediate features; prenorm always skips it.'}),
+            },
+        }
+
+    RETURN_TYPES = ('TENSOR',)
+    RETURN_NAMES = ('features',)
+    FUNCTION = 'extract'
+    CATEGORY = 'Kaloscope'
+
+    @torch.inference_mode()
+    def extract(self, image, model, output_type='default', layers='-1', intermediate_norm=True):
+        images = image if image.ndim == 4 else image.unsqueeze(0)
+        pil_images = [Image.fromarray((img * 255).clamp(0, 255).byte().cpu().numpy()) for img in images]
+        return (extract_batch(pil_images, model, output_type, layers, intermediate_norm),)
+
+
+class KaloscopeFeatureAnalysisNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            'required': {'features': ('TENSOR',), 'chart_type': (list(CHART_TYPES),)},
+            'optional': {
+                'metric': (['cosine', 'euclidean', 'manhattan'], {'default': 'cosine'}),
+                'normalize': ('BOOLEAN', {'default': True, 'tooltip': 'Normalize each image vector to unit L2 norm before distance/clustering.'}),
+                'cluster_method': (['kmeans', 'agglomerative', 'dbscan', 'none'], {'default': 'kmeans'}),
+                'n_clusters': ('INT', {'default': 3, 'min': 1, 'max': 512}),
+                'top_k': ('INT', {'default': 2, 'min': 1, 'max': 511, 'tooltip': 'Neighbor count for relation edges, neighbor ranking and isolation scores.'}),
+                'reference_index': ('INT', {'default': 0, 'min': 0, 'max': 511}),
+                'tensor_layout': (list(TENSOR_LAYOUTS), {'default': 'auto', 'tooltip': 'For 4D tensors select spatial [B,D,H,W] or layer_tokens [B,L,N,D] explicitly.'}),
+                'layer_index': ('INT', {'default': -1, 'min': -128, 'max': 127}),
+                'layer_pooling': (['selected', 'mean'], {'default': 'selected'}),
+                'token_pooling': (['mean', 'flatten'], {'default': 'mean'}),
+                'labels': ('STRING', {'default': '', 'multiline': True, 'tooltip': 'One image name per line or a JSON array, matching feature batch order.'}),
+                'images': ('IMAGE', {'tooltip': 'Optional thumbnails only; never used for model inference.'}),
+                'seed': ('INT', {'default': 42, 'min': 0, 'max': 2147483647}),
+                'perplexity': ('FLOAT', {'default': 5.0, 'min': 0.5, 'max': 100.0}),
+                'dbscan_eps': ('FLOAT', {'default': 0.35, 'min': 0.001, 'max': 100.0}),
+                'dbscan_min_samples': ('INT', {'default': 2, 'min': 1, 'max': 512}),
+                'max_dimensions': ('INT', {'default': 32, 'min': 1, 'max': 128}),
+                'heatmap_order': (['cluster', 'input'], {'default': 'cluster'}),
+                'grid_width': ('INT', {'default': 0, 'min': 0, 'max': 4096, 'tooltip': 'Patch grid columns; 0 infers a square grid. Spatial maps preserve their H,W.'}),
+                'width': ('INT', {'default': 1400, 'min': 512, 'max': 4096, 'step': 64}),
+                'height': ('INT', {'default': 1000, 'min': 512, 'max': 4096, 'step': 64}),
+            },
+        }
+
+    RETURN_TYPES = ('IMAGE', 'STRING', 'TENSOR')
+    RETURN_NAMES = ('visualization', 'analysis_json', 'distance_matrix')
+    FUNCTION = 'analyze'
+    CATEGORY = 'Kaloscope/Analysis'
+
+    def analyze(self, features, chart_type='relationship_graph', **kwargs):
+        return analyze_features(features, chart_type=chart_type, **kwargs)
+
+
+class KaloscopeImageAnalysisNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = KaloscopeFeatureAnalysisNode.INPUT_TYPES()
+        schema['required'].pop('features')
+        schema['required'] = {'image': ('IMAGE',), 'model': ('KALOSCOPE_MODEL',), **schema['required']}
+        schema['optional'].pop('images')
+        schema['optional'].update(KaloscopeExtractFeaturesNode.INPUT_TYPES()['optional'])
+        return schema
+
+    RETURN_TYPES = ('IMAGE', 'STRING', 'TENSOR', 'TENSOR')
+    RETURN_NAMES = ('visualization', 'analysis_json', 'features', 'distance_matrix')
+    FUNCTION = 'analyze'
+    CATEGORY = 'Kaloscope/Analysis'
+
+    def analyze(self, image, model, chart_type='relationship_graph', output_type='default', layers='-1',
+                intermediate_norm=True, **kwargs):
+        features = KaloscopeExtractFeaturesNode().extract(image, model, output_type, layers, intermediate_norm)[0]
+        images = image if image.ndim == 4 else image.unsqueeze(0)
+        if kwargs.get('tensor_layout', 'auto') == 'auto':
+            kwargs['tensor_layout'] = output_layout(output_type)
+        visualization, report, distances = analyze_features(features, chart_type=chart_type, images=images, **kwargs)
+        return visualization, report, features, distances
+
+
 NODE_CLASS_MAPPINGS = {
-    "LSNetModelLoader": LSNetModelLoader,
-    "LSNetArtistInference": LSNetArtistInferenceNode,
-    "LSNetArtistSimilarity": LSNetArtistSimilarityNode,
-    "LSNetCommonFeatures": LSNetCommonFeaturesNode,
-    "LSNetClustering": LSNetClusteringNode,
-    "LSNetFeatureComparison": LSNetFeatureComparisonNode,
-    "LSNetArtistImageConnector": LSNetArtistImageConnector
+    'KaloscopeModelLoader': KaloscopeModelLoader,
+    'KaloscopeArtistInference': KaloscopeArtistInferenceNode,
+    'KaloscopeArtistSimilarity': KaloscopeArtistSimilarityNode,
+    'KaloscopeCommonFeatures': KaloscopeCommonFeaturesNode,
+    'KaloscopeClustering': KaloscopeClusteringNode,
+    'KaloscopeFeatureComparison': KaloscopeFeatureComparisonNode,
+    'KaloscopeArtistImageConnector': KaloscopeArtistImageConnector,
+    'KaloscopeExtractFeatures': KaloscopeExtractFeaturesNode,
+    'KaloscopeFeatureAnalysis': KaloscopeFeatureAnalysisNode,
+    'KaloscopeImageAnalysis': KaloscopeImageAnalysisNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LSNetModelLoader": "LSNet Model Loader",
-    "LSNetArtistInference": "LSNet Artist Inference",
-    "LSNetArtistSimilarity": "LSNet Artist Similarity",
-    "LSNetCommonFeatures": "LSNet Common Features",
-    "LSNetClustering": "LSNet Clustering",
-    "LSNetFeatureComparison": "LSNet Feature Comparison",
-    "LSNetArtistImageConnector": "LSNet Image Connector"
+    'KaloscopeModelLoader': 'Kaloscope Model Loader',
+    'KaloscopeArtistInference': 'Kaloscope Artist Inference',
+    'KaloscopeArtistSimilarity': 'Kaloscope Artist Similarity',
+    'KaloscopeCommonFeatures': 'Kaloscope Common Features',
+    'KaloscopeClustering': 'Kaloscope Clustering',
+    'KaloscopeFeatureComparison': 'Kaloscope Feature Comparison',
+    'KaloscopeArtistImageConnector': 'Kaloscope Image Connector',
+    'KaloscopeExtractFeatures': 'Kaloscope Extract Features',
+    'KaloscopeFeatureAnalysis': 'Kaloscope Feature Analysis',
+    'KaloscopeImageAnalysis': 'Kaloscope Image Analysis',
 }
