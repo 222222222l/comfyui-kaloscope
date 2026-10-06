@@ -107,6 +107,43 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual({row["class_name"] for row in results}, {"a", "b", "c"})
         self.assertAlmostEqual(sum(row["probability"] for row in results), 1.0, places=6)
 
+    def test_normalized_classifier_matches_training_and_preserves_features(self):
+        # Exercise each supported config location, including safetensors-style
+        # architecture objects that have no embedded checkpoint metadata.
+        for location in ("top_level", "model", "embedded"):
+            with self.subTest(location=location):
+                self.config = {"model": "custom_vit", "input_size": 32}
+                self.payload["model_config"] = dict(self.options)
+                if location == "top_level":
+                    self.config["classifier_input_normalization"] = "l2_sqrt_dim"
+                elif location == "model":
+                    self.config["model"] = dict(self.options, classifier_input_normalization="l2_sqrt_dim")
+                else:
+                    self.payload["model_config"]["classifier_input_normalization"] = "l2_sqrt_dim"
+                self.config["feature_source"] = "projector"
+                if location == "model":
+                    self.config["model"]["feature_source"] = "projector"
+                self.save()
+                bundle = self.bundle()
+                batch = self.tensor(bundle)
+                with torch.inference_mode():
+                    expected = self.original(batch, projections=True)
+                    features = expected["features"]
+                    logits = self.original.head(torch.nn.functional.normalize(features.float(), dim=-1)
+                                                * features.shape[-1] ** 0.5)
+                    output, actual = bundle["model"](batch, return_both=True)
+                    torch.testing.assert_close(actual, logits)
+                    torch.testing.assert_close(output, expected["projections"])
+                    torch.testing.assert_close(bundle["model"](batch, return_features=True), output)
+                    torch.testing.assert_close(bundle["model"].extract_tensor(batch, "backbone"), features)
+                    self.assertFalse(torch.allclose(actual, expected["logits"]))
+
+    def test_invalid_classifier_normalization_fails(self):
+        self.config["classifier_input_normalization"] = "l2_typo"
+        self.save()
+        with self.assertRaisesRegex(ValueError, "classifier_input_normalization"):
+            self.bundle()
+
     def test_no_head_is_feature_only_even_with_metadata_classes(self):
         self.payload["model"] = {k: v for k, v in self.payload["model"].items() if not k.startswith("head.")}
         self.save()
@@ -271,6 +308,7 @@ class ModelLoadingTests(unittest.TestCase):
         from kaloscope_dinov3.models.convnext import ConvNeXt
         from model_loading import DinoInferenceModel
         backbone = ConvNeXt(depths=[1, 1, 1, 1], dims=[8, 16, 24, 32]).eval()
+        backbone.init_weights()  # Custom LayerNorm parameters start uninitialized.
         model = DinoInferenceModel(backbone, 'cls').eval()
         images = torch.rand(2, 3, 64, 96)
         with torch.inference_mode():
