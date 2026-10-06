@@ -1,6 +1,7 @@
 """Shared offline model loading for ComfyUI, CLI, WebUI and API."""
 import csv
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -114,8 +115,12 @@ def load_class_mapping(path):
 
 class DinoInferenceModel(nn.Module):
     """Expose the same return_features interface as LSNet without random heads."""
-    def __init__(self, backbone, pooling, head=None, projector=None, feature_source="backbone"):
+    def __init__(self, backbone, pooling, head=None, projector=None, feature_source="backbone",
+                 classifier_input_normalization="none"):
         super().__init__()
+        if classifier_input_normalization not in ("none", "l2_sqrt_dim"):
+            raise ValueError("classifier_input_normalization must be none or l2_sqrt_dim")
+        self.classifier_input_normalization = classifier_input_normalization
         self.backbone = backbone
         self.pooling = pooling
         self.head = head
@@ -204,7 +209,13 @@ class DinoInferenceModel(nn.Module):
             return output
         if self.head is None:
             raise ValueError("This checkpoint has no classification head; use feature extraction or similarity")
-        logits = self.head(features)
+        head_input = features
+        if self.classifier_input_normalization == "l2_sqrt_dim":
+            # Match frozen-head training: normalize in fp32, then allow the
+            # linear layer to follow the caller's autocast policy.
+            head_input = torch.nn.functional.normalize(features.float(), dim=-1) * math.sqrt(self.pooled_dim)
+            head_input = head_input.to(dtype=self.head.weight.dtype)
+        logits = self.head(head_input)
         return (output, logits) if return_both else logits
 
 
@@ -252,7 +263,8 @@ def _load_dino(name, state, model_config, feature_source=None):
             raise ValueError("Projector dimensions differ from pooling output")
         projector = nn.Sequential(nn.Linear(dimension, hidden), nn.GELU(), nn.Linear(hidden, output_dim))
         projector.load_state_dict({k.removeprefix("projector."): v for k, v in state.items() if k.startswith("projector.")}, strict=True)
-    return DinoInferenceModel(backbone, pooling, head, projector, source), temporal
+    normalization = model_config.get("classifier_input_normalization", "none")
+    return DinoInferenceModel(backbone, pooling, head, projector, source, normalization), temporal
 
 
 def _load_lsnet(name, state):
@@ -286,7 +298,7 @@ def load_model_bundle(model_dir=None, device="cuda", checkpoint=None, model_name
         options = {**embedded, **selection}
     else:
         name = selection
-        options = {**embedded, **{k: config[k] for k in ("kwargs", "pooling", "feature_source") if k in config}}
+        options = {**embedded, **{k: config[k] for k in ("kwargs", "pooling", "feature_source", "classifier_input_normalization") if k in config}}
     if not isinstance(name, str):
         raise ValueError("config.json 'model' must be an architecture name or object with 'name'")
     if name.startswith("dinov3_") or name in ("custom_vit", "custom_convnext"):

@@ -77,6 +77,27 @@ ComfyUI/
                └── config.json # 填写模型架构
 ```
 
+### DINOv3 分类头输入归一化
+
+使用冻结主干训练的分类头时，推理必须沿用其训练时的特征预处理。例如 Kaloscope 3.0 Preview 的 v1 画师分类头使用以下配置：
+
+```json
+{
+  "model": "dinov3_vitb16",
+  "checkpoint": "model.safetensors",
+  "pooling": "cls_mean",
+  "feature_source": "projector",
+  "input_size": 512,
+  "classifier_input_normalization": "l2_sqrt_dim"
+}
+```
+
+`l2_sqrt_dim` 在分类线性层之前，用 FP32 对池化特征做 L2 归一化，再乘以输入维数的平方根；对于 CLS + mean pooling，该维数为 1536。
+归一化只影响分类分支，原始主干特征和风格投影输出保持不变。此字段也可放在 `model` 对象或检查点的 `model_config` 中；省略时默认 `none`，兼容已有模型。不要给未经此预处理训练的分类头开启该选项。
+
+需使用支持该字段的插件版本；旧版本会忽略该字段并产生错误的分类 logits。
+模型包还应包含按分类输出顺序排列的 `class_mapping.csv`（列名 `class_id,class_name`）。上例假设完整权重包含 temporal 模型的 `log_temperature` 和 `bias`，插件因此采用短边缩放至 512 后中心裁剪的预处理。
+
 ### 2. 安装依赖
 
 将模型权重、配置和可选类别映射放入子文件夹后，在插件目录使用 ComfyUI 的 Python 环境安装依赖(webui插件可以跳过这一步，会自动安装依赖)：
